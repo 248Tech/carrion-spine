@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_nickname ON audit_log(nickname);
+
+CREATE TABLE IF NOT EXISTS spine_state (
+    guild_id INTEGER PRIMARY KEY,
+    audit_channel_id INTEGER,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -257,4 +263,47 @@ class Database:
                 """,
                 (user_id, nickname, full_path, timestamp, diff_summary, status, validation_result),
             )
+
+    async def get_audit_channel_id(self, guild_id: int) -> int | None:
+        return await asyncio.to_thread(self._get_audit_channel_id_sync, guild_id)
+
+    def _get_audit_channel_id_sync(self, guild_id: int) -> int | None:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT audit_channel_id FROM spine_state WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    async def set_audit_channel(self, guild_id: int, channel_id: int | None) -> None:
+        await asyncio.to_thread(self._set_audit_channel_sync, guild_id, channel_id)
+
+    def _set_audit_channel_sync(self, guild_id: int, channel_id: int | None) -> None:
+        from datetime import UTC, datetime
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO spine_state (guild_id, audit_channel_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    audit_channel_id = excluded.audit_channel_id,
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, channel_id, datetime.now(UTC).isoformat()),
+            )
+
+    async def get_last_applied(self, nickname: str) -> str | None:
+        return await asyncio.to_thread(self._get_last_applied_sync, nickname)
+
+    def _get_last_applied_sync(self, nickname: str) -> str | None:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT timestamp FROM audit_log
+                WHERE nickname = ? AND status = 'applied'
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                (nickname,),
+            ).fetchone()
+        return str(row[0]) if row else None
 

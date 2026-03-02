@@ -38,91 +38,51 @@ Carrion: Spine is built to reduce these operational risks by enforcing a secure 
 
 ## Installation
 
-### 1) Clone the Repository
+Choose one of three ways to run Spine: **Quickstart** (pipx / venv + CLI), **Docker Compose**, or **Production systemd**.
+
+---
+
+### Quickstart (pipx or venv)
+
+One-command local install for hobby and admin use.
 
 ```bash
 git clone https://github.com/248Tech/carrion-spine.git
 cd carrion-spine
+python3 -m venv .venv && source .venv/bin/activate   # or on Windows: .venv\Scripts\Activate.ps1
+pip install -e .
+carrion-spine init
+# Edit config.toml and set DISCORD_TOKEN in .env (see .env.example)
+carrion-spine doctor
+carrion-spine run
 ```
 
-### 2) Create and Activate a Virtual Environment
+- `carrion-spine init` creates `config.toml` and `.env.example` (interactive prompts).
+- `carrion-spine doctor` checks roots, backup dir, SQLite path; run before first `run`.
+- `carrion-spine run` starts the bot using `config.toml` and `DISCORD_TOKEN`.
 
-**Linux/macOS**
+Optional: install globally with `pipx install .` then run `carrion-spine` from anywhere.
+
+---
+
+### Docker Compose
+
+Repeatable containerized deploy. Bind-mount your config roots and use env for the token.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/248Tech/carrion-spine.git
+cd carrion-spine
+cp .env.example .env   # set DISCORD_TOKEN
+# Create config.toml (e.g. with carrion-spine init) and set data_dir=/var/lib/carrion-spine, backup_dir=/var/backups/carrion_spine
+# In compose.yaml, adjust the config roots volume (e.g. - /srv/7dtd:/srv/7dtd:rw)
+docker compose up -d
 ```
 
-**Windows (PowerShell)**
+See `compose.yaml` for volumes (data, backups, config roots). The image runs as non-root with reduced capabilities.
 
-```powershell
-py -3 -m venv .venv
-.venv\Scripts\Activate.ps1
-```
+---
 
-### 3) Install Dependencies
-
-If your repo includes `requirements.txt`:
-
-```bash
-pip install -U pip
-pip install -r requirements.txt
-```
-
-If not, install minimum runtime dependency directly:
-
-```bash
-pip install -U pip
-pip install "discord.py>=2,<3"
-```
-
-Optional: `lxml` (if you choose it for XML profile parsing).
-
-### 4) Load the Extension in Your Bot
-
-```python
-from discord.ext import commands
-
-bot = commands.Bot(command_prefix="!", intents=...)
-
-async def main() -> None:
-    async with bot:
-        await bot.load_extension("carrion_spine.commands")
-        await bot.start("YOUR_BOT_TOKEN")
-```
-
-### 5) Configure Roots and Permissions
-
-Example settings object (adjust to your environment):
-
-```python
-from pathlib import Path
-from carrion_spine.config import CarrionSpineSettings
-
-settings = CarrionSpineSettings(
-    config_roots=[
-        Path("/srv/7dtd/main"),
-        Path("/srv/7dtd/staging"),
-    ],
-    module_access_roles=[123456789012345678],
-    file_profile_roles={
-        "serverconfig.xml": [123456789012345678],
-        "serveradmin.xml": [234567890123456789],
-    },
-    max_upload_bytes=5 * 1024 * 1024,
-    backup_dir=Path("/var/backups/carrion_spine"),
-    backup_keep=10,
-)
-```
-
-### 6) Quick Compile Test
-
-```bash
-python -m compileall carrion_spine
-```
-
-## Production Deployment (systemd)
+### Production systemd
 
 Use a dedicated service account and locked-down filesystem permissions.
 
@@ -139,8 +99,9 @@ User=carrion
 Group=carrion
 WorkingDirectory=/opt/carrion-spine
 Environment="PYTHONUNBUFFERED=1"
-EnvironmentFile=/opt/carrion-spine/.env
-ExecStart=/opt/carrion-spine/.venv/bin/python -m your_bot_entrypoint
+EnvironmentFile=-/etc/carrion-spine/env
+Environment="CARRION_SPINE_CONFIG=/etc/carrion-spine/config.toml"
+ExecStart=/usr/bin/carrion-spine run --config /etc/carrion-spine/config.toml
 Restart=always
 RestartSec=5
 
@@ -155,6 +116,12 @@ ReadWritePaths=/opt/carrion-spine/data /var/backups/carrion_spine /srv/7dtd
 WantedBy=multi-user.target
 ```
 
+Generate unit and tmpfiles.d with the CLI (then copy the output into place):
+
+```bash
+carrion-spine install-systemd --user carrion --group carrion --config /etc/carrion-spine/config.toml
+```
+
 Deploy:
 
 ```bash
@@ -163,6 +130,32 @@ sudo systemctl enable carrion-spine
 sudo systemctl start carrion-spine
 sudo systemctl status carrion-spine
 ```
+
+## First successful change (tutorial)
+
+End-to-end flow for one edited config:
+
+1. **Index configs**  
+   In Discord: `/mm config pull`  
+   Spine scans configured roots and builds the nickname index.
+
+2. **List and pick**  
+   `/mm config list` (or `/mm config list root_filter: 7dtd`)  
+   Note a nickname, e.g. `serverconfig-7dtd`.
+
+3. **Start edit**  
+   `/mm edit nickname: serverconfig-7dtd`  
+   Spine sends the file as an attachment and creates a session. Download the file, edit it locally.
+
+4. **Upload and review**  
+   In the same channel, upload your modified file and in the message include: `mm-session:<session_id>` (the ID was in the edit response).  
+   Spine validates the file, shows a diff summary and inline excerpt (or a .diff attachment if long).
+
+5. **Apply or cancel**  
+   Use **Apply** to write the file atomically (with backup and conflict check) or **Cancel** to abandon.
+
+6. **Verify**  
+   Changes are written to disk; the audit log records the apply. Optional: use `/mm spine setup` to run readiness checks and confirm roots/backup/roles.
 
 ## Security Model
 

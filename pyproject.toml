@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carrion-spine"
+version = "0.2.0"
+description = "Discord-first configuration control plane for 7 Days to Die"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2,<3",
+]
+optional-dependencies = {
+    "lxml": ["lxml>=4.9"],
+    "watchdog": ["watchdog>=3.0"],
+    "all": ["lxml>=4.9", "watchdog>=3.0"],
+}
+
+[project.scripts]
+carrion-spine = "carrion_spine.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["carrion_spine"]
+
+[tool.hatch.build.targets.sdist]
+include = ["carrion_spine", "LICENSE", "README.md", "CHANGELOG.md"]

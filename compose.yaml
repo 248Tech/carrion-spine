@@ -1,0 +1,32 @@
+# Carrion: Spine — Docker Compose (copy and adjust paths)
+# Usage: set DISCORD_TOKEN in .env, then: docker compose up -d
+services:
+  spine:
+    build: .
+    image: carrion-spine:latest
+    container_name: carrion-spine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - CARRION_SPINE_CONFIG=/etc/carrion-spine/config.toml
+    volumes:
+      # Config file (create from carrion-spine init or copy your config.toml)
+      - ./config.toml:/etc/carrion-spine/config.toml:ro
+      # Config roots (read-write so Spine can write files)
+      - /srv/7dtd:/srv/7dtd:rw
+      # Data dir (SQLite, uploads, diffs)
+      - spine-data:/var/lib/carrion-spine
+      # Backups (outside roots)
+      - spine-backups:/var/backups/carrion_spine
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+
+volumes:
+  spine-data:
+  spine-backups:

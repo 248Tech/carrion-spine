@@ -4,6 +4,7 @@ import asyncio
 import io
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Sequence
 
 import discord
 from discord import app_commands
@@ -11,10 +12,12 @@ from discord.ext import commands
 
 from .apply import apply_edit
 from .config import CarrionSpineSettings
+from .config_loader import load_config_from_env
 from .database import ConfigRecord, Database
 from .diffing import generate_unified_diff, write_diff_attachment
 from .discovery import SUPPORTED_EXTENSIONS, ConfigRoot, scan_configs
 from .permissions import PermissionConfig, PermissionService
+from .readiness import run_readiness_checks
 from .sessions import SessionManager
 from .validation import ValidationService
 
@@ -48,6 +51,7 @@ class CarrionSpineConfigCog(commands.Cog):
 
     mm_group = app_commands.Group(name="mm", description="Carrion: Spine config tools")
     config_group = app_commands.Group(name="config", description="Config index actions", parent=mm_group)
+    spine_group = app_commands.Group(name="spine", description="Spine setup and readiness", parent=mm_group)
 
     def __init__(
         self,
@@ -55,10 +59,14 @@ class CarrionSpineConfigCog(commands.Cog):
         *,
         db: Database,
         settings: CarrionSpineSettings,
+        upload_dir: Path | None = None,
+        diff_dir: Path | None = None,
+        roots: Sequence[ConfigRoot] | None = None,
     ) -> None:
         self.bot = bot
         self.db = db
         self.settings = settings
+        self._roots = roots  # when set, used for config_pull instead of deriving from settings
         self.validation = ValidationService()
         self.permission_service = PermissionService(
             PermissionConfig(
@@ -68,12 +76,14 @@ class CarrionSpineConfigCog(commands.Cog):
                 },
             )
         )
+        ud = upload_dir or Path("./data/mm_uploads")
+        dd = diff_dir or Path("./data/mm_diffs")
         self.sessions = SessionManager(
             db=self.db,
-            upload_dir=Path("./data/mm_uploads"),
+            upload_dir=ud,
             max_upload_bytes=settings.max_upload_bytes,
         )
-        self.diff_dir = Path("./data/mm_diffs")
+        self.diff_dir = dd
 
     async def cog_load(self) -> None:
         await self.db.initialize()
@@ -85,27 +95,115 @@ class CarrionSpineConfigCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        roots = [ConfigRoot(token=Path(root).name.lower(), path=Path(root)) for root in self.settings.config_roots]
+        if self._roots:
+            roots = list(self._roots)
+        else:
+            roots = [ConfigRoot(token=Path(root).name.lower(), path=Path(root)) for root in self.settings.config_roots]
         records = await scan_configs(roots)
         await self.db.replace_index_records(records)
-        await interaction.followup.send(f"Indexed {len(records)} config files.", ephemeral=True)
+        # Build short summary: nickname, path, type, hash, last applied
+        last_applied_map: dict[str, str] = {}
+        for r in records[:20]:
+            ts = await self.db.get_last_applied(r.nickname)
+            if ts:
+                last_applied_map[r.nickname] = ts
+        summary_lines = [f"Indexed **{len(records)}** config files."]
+        if records:
+            summary_lines.append("Sample (nickname → path, type, hash):")
+            for r in records[:5]:
+                rel = self._relative_display_path(Path(r.full_path), r.root_token)
+                applied = last_applied_map.get(r.nickname, "")
+                applied_str = f" (last applied: {applied})" if applied else ""
+                summary_lines.append(f"`{r.nickname}` → `{rel}` [{r.file_type}] `{r.file_hash[:8]}…`{applied_str}")
+        await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
 
-    @config_group.command(name="list", description="List indexed configs.")
+    @config_group.command(name="list", description="List indexed configs. Filter by root token (e.g. 7dtd, main).")
+    @app_commands.describe(root_filter="Optional root token to filter by (e.g. 7dtd, main). Omit to list all.")
     async def config_list(self, interaction: discord.Interaction, root_filter: str | None = None) -> None:
         if not self.permission_service.has_module_access(interaction.user):
             await interaction.response.send_message("You do not have module access.", ephemeral=True)
             return
         records = await self.db.list_configs(root_filter=root_filter)
         if not records:
-            await interaction.response.send_message("No indexed configs found.", ephemeral=True)
+            hint = " Use `/mm config pull` first, or try a different root_filter." if root_filter else " Run `/mm config pull` to index config roots."
+            await interaction.response.send_message("No indexed configs found." + hint, ephemeral=True)
             return
 
         lines: list[str] = []
         for row in records[:100]:
             rel = self._relative_display_path(Path(row.full_path), row.root_token)
-            lines.append(f"`{row.nickname}` -> `{rel}`")
+            lines.append(f"`{row.nickname}` → `{rel}`")
         suffix = "\n...truncated..." if len(records) > 100 else ""
+        if root_filter:
+            lines.insert(0, f"Filter: `{root_filter}`")
         await interaction.response.send_message("\n".join(lines) + suffix, ephemeral=True)
+
+    @spine_group.command(name="setup", description="Run readiness checks: roots, backup dir, roles. Admin-only.")
+    async def spine_setup(self, interaction: discord.Interaction) -> None:
+        if not self.permission_service.has_module_access(interaction.user):
+            await interaction.response.send_message("You do not have module access.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if self._roots:
+            roots = list(self._roots)
+        else:
+            roots = [ConfigRoot(token=Path(r).name.lower(), path=Path(r)) for r in self.settings.config_roots]
+        backup_dir = self.settings.backup_dir
+        sqlite_path = self.db.db_path
+        data_dir = sqlite_path.parent
+
+        results = await asyncio.to_thread(
+            run_readiness_checks,
+            roots=roots,
+            backup_dir=backup_dir,
+            data_dir=data_dir,
+            sqlite_path=sqlite_path,
+        )
+        lines = ["**Carrion: Spine readiness**"]
+        critical_ok = True
+        for r in results:
+            icon = "✅" if r.ok else "⚠️"
+            if not r.ok:
+                critical_ok = False
+            lines.append(f"{icon} {r.name}: {r.message}")
+
+        # Role checks (guild)
+        if interaction.guild:
+            guild_role_ids = {role.id for role in interaction.guild.roles}
+            missing = [rid for rid in self.settings.module_access_roles if rid not in guild_role_ids]
+            if missing:
+                lines.append(f"⚠️ roles: module_access_roles {missing} not found in this guild")
+                critical_ok = False
+            else:
+                lines.append("✅ roles: all module_access_roles exist in this guild")
+        else:
+            lines.append("⚠️ roles: run in a server to verify role IDs")
+
+        audit_cid = await self.db.get_audit_channel_id(interaction.guild_id) if interaction.guild_id else None
+        if audit_cid:
+            lines.append(f"✅ audit channel: <#{audit_cid}>")
+        else:
+            lines.append("Audit channel: not set (optional). Use `/mm spine set-audit-channel` to set.")
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    @spine_group.command(name="set-audit-channel", description="Set the channel for audit log posts (optional).")
+    @app_commands.describe(channel="Channel to post audit events to. Omit to clear.")
+    async def spine_set_audit_channel(
+        self, interaction: discord.Interaction, channel: discord.TextChannel | None = None
+    ) -> None:
+        if not self.permission_service.has_module_access(interaction.user):
+            await interaction.response.send_message("You do not have module access.", ephemeral=True)
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+        await self.db.set_audit_channel(interaction.guild_id, channel.id if channel else None)
+        if channel:
+            await interaction.response.send_message(f"Audit channel set to {channel.mention}.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Audit channel cleared.", ephemeral=True)
 
     @mm_group.command(name="edit", description="Start attachment-based edit session.")
     async def edit_start(self, interaction: discord.Interaction, nickname: str) -> None:
@@ -317,15 +415,27 @@ class CarrionSpineConfigCog(commands.Cog):
 
 async def setup(bot: commands.Bot) -> None:
     """
-    Example extension setup.
-
-    TODO: Load settings from environment/config file.
+    Extension setup. Uses CARRION_SPINE_CONFIG env if set; otherwise defaults.
     """
-    db = Database(Path("./data/carrion_spine.sqlite3"))
-    settings = CarrionSpineSettings(
-        config_roots=[Path("/srv/7dtd")],
-        module_access_roles=[],
-        file_profile_roles={},
-    )
-    await bot.add_cog(CarrionSpineConfigCog(bot, db=db, settings=settings))
+    loaded = load_config_from_env()
+    if loaded:
+        db = Database(loaded.sqlite_path)
+        await bot.add_cog(
+            CarrionSpineConfigCog(
+                bot,
+                db=db,
+                settings=loaded.settings,
+                upload_dir=loaded.upload_dir,
+                diff_dir=loaded.diff_dir,
+                roots=loaded.roots,
+            )
+        )
+    else:
+        db = Database(Path("./data/carrion_spine.sqlite3"))
+        settings = CarrionSpineSettings(
+            config_roots=[Path("/srv/7dtd")],
+            module_access_roles=[],
+            file_profile_roles={},
+        )
+        await bot.add_cog(CarrionSpineConfigCog(bot, db=db, settings=settings))
 
