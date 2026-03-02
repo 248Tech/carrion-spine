@@ -29,6 +29,14 @@ Managing 7 Days to Die server configs by manual file edits over SSH, panel uploa
 - Atomic file writes (`temp + fsync + replace`) with rolling backups
 - Role-based access control by Discord role ID
 - SQLite-backed session state and audit log trail
+- AI suggest (MVP): `/mm ai suggest` — single-file LLM proposals through the same pipeline as human edits.
+
+## /mm ai suggest (MVP)
+
+- **Command:** `/mm ai suggest target:<nickname> instruction:<text>` with optional `mode` (patch | full) and `temperature`.
+- **Safety:** AI never applies changes automatically. Every proposal goes through format validation, profile validation, policy checks (e.g. blocklist keys, serveradmin.xml restricted), then the same conflict check and atomic apply as manual edits. Default `ai.allow_external = false` (only local HTTP provider unless explicitly enabled).
+- **Audit:** Prompt hash, input hash, output diff hash, provider/model, and redaction flag are stored; validation results are logged.
+- **UX:** Proposal shows diff summary and Apply / Cancel / Revise Prompt. Apply uses the existing apply pipeline.
 
 ## Discord Bot Setup (Quickstart)
 

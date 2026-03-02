@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Sequence
+from uuid import uuid4
 
 import discord
 from discord import app_commands
@@ -12,9 +14,9 @@ from discord.ext import commands
 
 from .apply import apply_edit
 from .config import CarrionSpineSettings
-from .config_loader import load_config_from_env
-from .database import ConfigRecord, Database
-from .diffing import generate_unified_diff, write_diff_attachment
+from .config_loader import AIConfig, load_config_from_env
+from .database import AIProposalRecord, ConfigRecord, Database, EditSessionRecord
+from .diffing import count_diff_lines, generate_unified_diff, write_diff_attachment
 from .discovery import SUPPORTED_EXTENSIONS, ConfigRoot, scan_configs
 from .permissions import PermissionConfig, PermissionService
 from .readiness import run_readiness_checks
@@ -46,12 +48,80 @@ class EditDecisionView(discord.ui.View):
         await self.cog.handle_cancel(interaction, self.session_id)
 
 
+class RevisePromptModal(discord.ui.Modal, title="Revise AI instruction"):
+    instruction = discord.ui.TextInput(
+        label="New instruction",
+        style=discord.TextStyle.paragraph,
+        placeholder="Describe the change you want...",
+        required=True,
+        max_length=2000,
+    )
+
+    def __init__(self, cog: "CarrionSpineConfigCog", session_id: str, proposal_id: str, nickname: str, mode: str, temperature: float, owner_id: int) -> None:
+        super().__init__()
+        self.cog = cog
+        self.session_id = session_id
+        self.proposal_id = proposal_id
+        self.nickname = nickname
+        self.mode = mode
+        self.temperature = temperature
+        self.owner_id = owner_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        content, view, files = await self.cog._run_ai_suggest_flow(
+            interaction.user.id,
+            self.nickname,
+            self.instruction.value,
+            self.mode,
+            self.temperature,
+        )
+        await interaction.followup.send(content, view=view, files=files, ephemeral=True)
+
+
+class AIDecisionView(discord.ui.View):
+    """Apply / Cancel / Revise Prompt for AI proposals."""
+
+    def __init__(self, cog: "CarrionSpineConfigCog", session_id: str, proposal_id: str, nickname: str, mode: str, temperature: float, owner_user_id: int) -> None:
+        super().__init__(timeout=30 * 60)
+        self.cog = cog
+        self.session_id = session_id
+        self.proposal_id = proposal_id
+        self.nickname = nickname
+        self.mode = mode
+        self.temperature = temperature
+        self.owner_user_id = owner_user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message("Only the session owner can act on this proposal.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Apply", style=discord.ButtonStyle.success)
+    async def apply_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.cog.handle_apply(interaction, self.session_id)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.cog.handle_cancel(interaction, self.session_id)
+
+    @discord.ui.button(label="Revise Prompt", style=discord.ButtonStyle.primary)
+    async def revise_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        modal = RevisePromptModal(
+            self.cog, self.session_id, self.proposal_id, self.nickname,
+            self.mode, self.temperature, self.owner_user_id,
+        )
+        await interaction.response.send_modal(modal)
+
+
 class CarrionSpineConfigCog(commands.Cog):
     """Carrion: Spine Discord-first Config Editor scaffold."""
 
     mm_group = app_commands.Group(name="mm", description="Carrion: Spine config tools")
     config_group = app_commands.Group(name="config", description="Config index actions", parent=mm_group)
     spine_group = app_commands.Group(name="spine", description="Spine setup and readiness", parent=mm_group)
+    ai_group = app_commands.Group(name="ai", description="AI suggest (single-file proposals)", parent=mm_group)
 
     def __init__(
         self,
@@ -62,11 +132,17 @@ class CarrionSpineConfigCog(commands.Cog):
         upload_dir: Path | None = None,
         diff_dir: Path | None = None,
         roots: Sequence[ConfigRoot] | None = None,
+        ai_config: AIConfig | None = None,
     ) -> None:
         self.bot = bot
         self.db = db
         self.settings = settings
         self._roots = roots  # when set, used for config_pull instead of deriving from settings
+        self._ai_config = ai_config
+        self._ai_provider = None
+        if ai_config and ai_config.enabled:
+            from .ai.providers import get_provider
+            self._ai_provider = get_provider(ai_config)
         self.validation = ValidationService()
         self.permission_service = PermissionService(
             PermissionConfig(
@@ -205,6 +281,42 @@ class CarrionSpineConfigCog(commands.Cog):
         else:
             await interaction.response.send_message("Audit channel cleared.", ephemeral=True)
 
+    @ai_group.command(name="suggest", description="Generate an AI proposal for a config file (same pipeline as human edits).")
+    @app_commands.describe(
+        target="Config nickname (from /mm config list).",
+        instruction="What change to make (e.g. set ServerMaxPlayerCount to 16).",
+        mode="patch = unified diff only; full = full file content.",
+        temperature="Model temperature 0.0–1.0 (default from config).",
+    )
+    async def ai_suggest(
+        self,
+        interaction: discord.Interaction,
+        target: str,
+        instruction: str,
+        mode: str = "patch",
+        temperature: float | None = None,
+    ) -> None:
+        if not self._ai_config or not self._ai_config.enabled:
+            await interaction.response.send_message("AI suggest is not enabled.", ephemeral=True)
+            return
+        role_ids = {r.id for r in (interaction.user.roles if isinstance(interaction.user, discord.Member) else [])}
+        if not role_ids.intersection(set(self._ai_config.suggest_roles)):
+            await interaction.response.send_message("You do not have AI suggest permission.", ephemeral=True)
+            return
+        mode = (mode or self._ai_config.mode_default).lower()
+        if mode not in ("patch", "full"):
+            mode = "patch"
+        temp = temperature if temperature is not None else self._ai_config.temperature_default
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        content, view, files = await self._run_ai_suggest_flow(
+            interaction.user.id,
+            target.strip(),
+            instruction.strip(),
+            mode,
+            temp,
+        )
+        await interaction.followup.send(content, view=view, files=files, ephemeral=True)
+
     @mm_group.command(name="edit", description="Start attachment-based edit session.")
     async def edit_start(self, interaction: discord.Interaction, nickname: str) -> None:
         if not self.permission_service.has_module_access(interaction.user):
@@ -331,6 +443,12 @@ class CarrionSpineConfigCog(commands.Cog):
         if not self.permission_service.has_module_access(interaction.user):
             await interaction.response.send_message("You do not have module access.", ephemeral=True)
             return
+        session = await self.db.get_session(session_id)
+        if session and getattr(session, "session_type", "manual") == "ai" and self._ai_config:
+            role_ids = {r.id for r in (interaction.user.roles if isinstance(interaction.user, discord.Member) else [])}
+            if not role_ids.intersection(set(self._ai_config.apply_roles)):
+                await interaction.response.send_message("You do not have AI apply permission.", ephemeral=True)
+                return
         await interaction.response.defer(ephemeral=True, thinking=True)
         session = await self.db.get_session(session_id)
         if not session or session.status != "pending":
@@ -354,12 +472,27 @@ class CarrionSpineConfigCog(commands.Cog):
             backup_keep=self.settings.backup_keep,
         )
         status = "applied" if result.ok else "apply_failed"
+        actor_type = "human"
+        ai_proposal_id = None
+        provider = None
+        model = None
+        if getattr(session, "session_type", "manual") == "ai" and getattr(session, "ai_proposal_id", None):
+            ai_proposal_id = session.ai_proposal_id
+            actor_type = "ai"
+            prop = await self.db.get_ai_proposal(ai_proposal_id) if ai_proposal_id else None
+            if prop:
+                provider = prop.provider
+                model = prop.model
         await self._audit(
             user_id=interaction.user.id,
             config=config,
             diff_summary=result.message,
             status=status,
             validation_result="ok" if result.ok else result.message,
+            actor_type=actor_type,
+            ai_proposal_id=ai_proposal_id,
+            provider=provider,
+            model=model,
         )
         if result.ok:
             await self.sessions.mark_applied(session_id)
@@ -383,6 +516,145 @@ class CarrionSpineConfigCog(commands.Cog):
                 )
         await interaction.response.send_message("Edit cancelled.", ephemeral=True)
 
+    async def _run_ai_suggest_flow(
+        self,
+        user_id: int,
+        nickname: str,
+        instruction: str,
+        mode: str,
+        temperature: float,
+    ) -> tuple[str, discord.ui.View | None, list[discord.File]]:
+        """Run AI suggest: resolve file, call provider, validate, store proposal, return content + view + files."""
+        from .ai import redact_secrets, validate_full_output, validate_patch_output
+        from .ai.patch_apply import apply_unified_patch
+        from .ai.policy import policy_check
+
+        if not self._ai_config or not self._ai_provider:
+            return "AI is not enabled.", None, []
+
+        config = await self.db.get_config_by_nickname(nickname)
+        if not config:
+            return "Unknown nickname.", None, []
+        live_path = Path(config.full_path)
+        if not live_path.exists():
+            return "Indexed file no longer exists.", None, []
+
+        baseline_bytes = await asyncio.to_thread(live_path.read_bytes)
+        baseline_text = baseline_bytes.decode("utf-8", errors="replace")
+        baseline_hash = hashlib.sha256(baseline_bytes).hexdigest()
+        if len(baseline_bytes) > self._ai_config.max_input_bytes:
+            return f"File exceeds max input size ({self._ai_config.max_input_bytes} bytes).", None, []
+
+        to_send = baseline_text
+        redaction_applied = False
+        if self._ai_config.redact_secrets:
+            to_send, redaction_applied = redact_secrets(baseline_text)
+
+        try:
+            if mode == "patch":
+                raw = await self._ai_provider.generate_patch(
+                    instruction, to_send, live_path.name, temperature, self._ai_config.max_output_bytes
+                )
+                normalized, err = validate_patch_output(raw, self._ai_config.max_output_bytes)
+                if err:
+                    return f"Patch output invalid: {err}", None, []
+                try:
+                    proposed_text = apply_unified_patch(baseline_text, normalized)
+                except ValueError as e:
+                    return f"Patch apply failed: {e}", None, []
+            else:
+                raw = await self._ai_provider.generate_full(
+                    instruction, to_send, live_path.name, temperature, self._ai_config.max_output_bytes
+                )
+                normalized, err = validate_full_output(raw, self._ai_config.max_output_bytes)
+                if err:
+                    return f"Full output invalid: {err}", None, []
+                proposed_text = normalized
+        except Exception as e:
+            return f"Provider error: {e}", None, []
+
+        proposed_bytes = proposed_text.encode("utf-8")
+        format_result = self.validation.validate(
+            file_type=config.file_type,
+            path=live_path,
+            content=proposed_bytes,
+        )
+        if not format_result.ok:
+            return f"Validation failed: {format_result.message}", None, []
+
+        # Elevated = allowed to edit serveradmin.xml; we cannot resolve roles without guild here, so safe default
+        has_elevated = False
+        ok, policy_msg = policy_check(
+            file_path=live_path,
+            proposed_content=proposed_text,
+            has_elevated_role=has_elevated,
+        )
+        if not ok:
+            return f"Policy: {policy_msg}", None, []
+
+        session_id = uuid4().hex
+        proposal_id = uuid4().hex
+        ext = live_path.suffix or ".txt"
+        proposed_path = self.sessions.upload_dir / f"{session_id}_proposed{ext}"
+        await asyncio.to_thread(proposed_path.write_bytes, proposed_bytes)
+
+        prompt_hash = hashlib.sha256(instruction.encode()).hexdigest()
+        input_hash = hashlib.sha256(baseline_text.encode()).hexdigest()
+        output_hash = hashlib.sha256(proposed_text.encode()).hexdigest()
+
+        created_at = datetime.now(UTC).isoformat()
+        session_record = EditSessionRecord(
+            session_id=session_id,
+            user_id=user_id,
+            nickname=nickname,
+            original_hash=baseline_hash,
+            created_at=created_at,
+            status="pending",
+            uploaded_path=str(proposed_path),
+            session_type="ai",
+            ai_proposal_id=proposal_id,
+        )
+        await self.db.create_session(session_record)
+        proposal_record = AIProposalRecord(
+            id=proposal_id,
+            session_id=session_id,
+            user_id=user_id,
+            nickname=nickname,
+            provider=self._ai_config.provider,
+            model=self._ai_config.openai_model if self._ai_config.provider == "openai" else self._ai_config.local_http_model,
+            mode=mode,
+            prompt_hash=prompt_hash,
+            input_hash=input_hash,
+            output_hash=output_hash,
+            redaction_applied=redaction_applied,
+            created_at=created_at,
+            status="pending",
+            error_message=None,
+            proposed_payload_path=str(proposed_path),
+        )
+        await self.db.create_ai_proposal(proposal_record)
+
+        diff_result = generate_unified_diff(
+            old_text=baseline_text,
+            new_text=proposed_text,
+            old_label=f"{nickname}:baseline",
+            new_label=f"{nickname}:proposed",
+        )
+        summary = diff_result.summary.as_text()
+        content = f"**Proposal created** (AI). Diff: {summary}. Validation passed. Review and Apply or Revise Prompt."
+        view = AIDecisionView(
+            self, session_id, proposal_id, nickname, mode, temperature, user_id
+        )
+        files: list[discord.File] = []
+        diff_path = self.diff_dir / f"{session_id}.diff"
+        write_diff_attachment(diff_result.full_text, diff_path)
+        files.append(discord.File(str(diff_path), filename="proposal.diff"))
+        if diff_result.is_truncated:
+            content += f"\n```diff\n{diff_result.excerpt_text[:1500]}...\n```"
+        else:
+            content += f"\n```diff\n{diff_result.excerpt_text}\n```"
+        return content, view, files
+
     def _relative_display_path(self, full_path: Path, root_token: str) -> str:
         for root in self.settings.config_roots:
             root_path = Path(root)
@@ -401,6 +673,10 @@ class CarrionSpineConfigCog(commands.Cog):
         diff_summary: str | None,
         status: str,
         validation_result: str,
+        actor_type: str = "human",
+        ai_proposal_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
         await self.db.insert_audit(
             user_id=user_id,
@@ -410,6 +686,10 @@ class CarrionSpineConfigCog(commands.Cog):
             diff_summary=diff_summary,
             status=status,
             validation_result=validation_result,
+            actor_type=actor_type,
+            ai_proposal_id=ai_proposal_id,
+            provider=provider,
+            model=model,
         )
 
 
@@ -428,6 +708,7 @@ async def setup(bot: commands.Bot) -> None:
                 upload_dir=loaded.upload_dir,
                 diff_dir=loaded.diff_dir,
                 roots=loaded.roots,
+                ai_config=loaded.ai_config,
             )
         )
     else:

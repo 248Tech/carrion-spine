@@ -13,6 +13,26 @@ from .discovery import ConfigRoot
 
 
 @dataclass(slots=True)
+class AIConfig:
+    """AI suggest section. allow_external=false unless explicitly enabled."""
+
+    enabled: bool
+    provider: str  # "openai" | "local_http"
+    mode_default: str
+    redact_secrets: bool
+    allow_external: bool
+    max_input_bytes: int
+    max_output_bytes: int
+    temperature_default: float
+    suggest_roles: tuple[int, ...]
+    apply_roles: tuple[int, ...]
+    openai_api_key_env: str
+    openai_model: str
+    local_http_url: str
+    local_http_model: str
+
+
+@dataclass(slots=True)
 class LoadedConfig:
     """Fully resolved config: settings, paths, and roots for discovery."""
 
@@ -24,6 +44,7 @@ class LoadedConfig:
     diff_dir: Path
     backup_dir: Path
     roots: list[ConfigRoot]
+    ai_config: AIConfig | None = None
 
 
 def _get_env(key: str, default: str | None = None) -> str | None:
@@ -155,6 +176,40 @@ def load_config(config_path: Path) -> LoadedConfig:
         backup_keep=backup_keep,
     )
 
+    # [ai] section (optional)
+    ai_config: AIConfig | None = None
+    ai_section = data.get("ai")
+    if isinstance(ai_section, dict):
+        enabled = bool(ai_section.get("enabled", False))
+        provider = str(ai_section.get("provider", "local_http")).strip().lower()
+        if provider not in ("openai", "local_http"):
+            provider = "local_http"
+        allow_external = bool(ai_section.get("allow_external", False))
+        if not allow_external and provider != "local_http":
+            enabled = False  # refuse external unless explicitly allowed
+        openai_block = ai_section.get("openai") or {}
+        local_block = ai_section.get("local_http") or {}
+        if not isinstance(openai_block, dict):
+            openai_block = {}
+        if not isinstance(local_block, dict):
+            local_block = {}
+        ai_config = AIConfig(
+            enabled=enabled,
+            provider=provider,
+            mode_default=str(ai_section.get("mode_default", "patch")).strip().lower() or "patch",
+            redact_secrets=bool(ai_section.get("redact_secrets", True)),
+            allow_external=allow_external,
+            max_input_bytes=int(ai_section.get("max_input_bytes", 200_000)),
+            max_output_bytes=int(ai_section.get("max_output_bytes", 200_000)),
+            temperature_default=float(ai_section.get("temperature_default", 0.2)),
+            suggest_roles=tuple(_int_list(ai_section.get("suggest_roles"))) or tuple(module_roles),
+            apply_roles=tuple(_int_list(ai_section.get("apply_roles"))) or tuple(module_roles),
+            openai_api_key_env=str(openai_block.get("api_key_env", "OPENAI_API_KEY")),
+            openai_model=str(openai_block.get("model", "gpt-4o-mini")),
+            local_http_url=str(local_block.get("url", "http://localhost:11434/v1/chat/completions")),
+            local_http_model=str(local_block.get("model", "llama3.1")),
+        )
+
     return LoadedConfig(
         settings=settings,
         config_path=config_path,
@@ -164,6 +219,7 @@ def load_config(config_path: Path) -> LoadedConfig:
         diff_dir=diff_dir,
         backup_dir=backup_resolved,
         roots=roots,
+        ai_config=ai_config,
     )
 
 

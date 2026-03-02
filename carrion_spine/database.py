@@ -32,11 +32,32 @@ CREATE TABLE IF NOT EXISTS edit_sessions (
     created_at TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('pending', 'applied', 'cancelled')),
     uploaded_path TEXT,
+    session_type TEXT NOT NULL DEFAULT 'manual' CHECK(session_type IN ('manual', 'ai')),
+    ai_proposal_id TEXT,
     FOREIGN KEY(nickname) REFERENCES config_index(nickname)
 );
 
 CREATE INDEX IF NOT EXISTS idx_edit_sessions_user ON edit_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_edit_sessions_status ON edit_sessions(status);
+
+CREATE TABLE IF NOT EXISTS ai_proposals (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    nickname TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK(mode IN ('patch', 'full')),
+    prompt_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    output_hash TEXT NOT NULL,
+    redaction_applied INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'applied', 'cancelled', 'failed')),
+    error_message TEXT,
+    proposed_payload_path TEXT,
+    FOREIGN KEY(session_id) REFERENCES edit_sessions(session_id)
+);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +67,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
     timestamp TEXT NOT NULL,
     diff_summary TEXT,
     status TEXT NOT NULL,
-    validation_result TEXT NOT NULL
+    validation_result TEXT NOT NULL,
+    actor_type TEXT NOT NULL DEFAULT 'human' CHECK(actor_type IN ('human', 'ai')),
+    ai_proposal_id TEXT,
+    provider TEXT,
+    model TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
@@ -80,6 +105,27 @@ class EditSessionRecord:
     created_at: str
     status: str
     uploaded_path: str | None
+    session_type: str = "manual"
+    ai_proposal_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AIProposalRecord:
+    id: str
+    session_id: str
+    user_id: int
+    nickname: str
+    provider: str
+    model: str
+    mode: str
+    prompt_hash: str
+    input_hash: str
+    output_hash: str
+    redaction_applied: bool
+    created_at: str
+    status: str
+    error_message: str | None
+    proposed_payload_path: str | None
 
 
 class Database:
@@ -94,6 +140,19 @@ class Database:
     def _initialize_sync(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
             conn.executescript(SCHEMA_SQL)
+            # Migrations: add columns if missing (ignore if already exist)
+            for sql in [
+                "ALTER TABLE edit_sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'manual'",
+                "ALTER TABLE edit_sessions ADD COLUMN ai_proposal_id TEXT",
+                "ALTER TABLE audit_log ADD COLUMN actor_type TEXT NOT NULL DEFAULT 'human'",
+                "ALTER TABLE audit_log ADD COLUMN ai_proposal_id TEXT",
+                "ALTER TABLE audit_log ADD COLUMN provider TEXT",
+                "ALTER TABLE audit_log ADD COLUMN model TEXT",
+            ]:
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError:
+                    pass
 
     async def replace_index_records(self, records: Iterable[ConfigRecord]) -> None:
         await asyncio.to_thread(self._replace_index_records_sync, list(records))
@@ -172,8 +231,9 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO edit_sessions (
-                    session_id, user_id, nickname, original_hash, created_at, status, uploaded_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    session_id, user_id, nickname, original_hash, created_at, status, uploaded_path,
+                    session_type, ai_proposal_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.session_id,
@@ -183,6 +243,8 @@ class Database:
                     session.created_at,
                     session.status,
                     session.uploaded_path,
+                    getattr(session, "session_type", "manual"),
+                    getattr(session, "ai_proposal_id", None),
                 ),
             )
 
@@ -194,7 +256,8 @@ class Database:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 """
-                SELECT session_id, user_id, nickname, original_hash, created_at, status, uploaded_path
+                SELECT session_id, user_id, nickname, original_hash, created_at, status, uploaded_path,
+                       COALESCE(session_type, 'manual') AS session_type, ai_proposal_id
                 FROM edit_sessions
                 WHERE session_id = ?
                 """,
@@ -202,7 +265,12 @@ class Database:
             ).fetchone()
         if not row:
             return None
-        return EditSessionRecord(**dict(row))
+        d = dict(row)
+        if "session_type" not in d:
+            d["session_type"] = "manual"
+        if "ai_proposal_id" not in d:
+            d["ai_proposal_id"] = None
+        return EditSessionRecord(**d)
 
     async def update_session_status(
         self, session_id: str, status: str, uploaded_path: str | None = None
@@ -232,6 +300,10 @@ class Database:
         diff_summary: str | None,
         status: str,
         validation_result: str,
+        actor_type: str = "human",
+        ai_proposal_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
         await asyncio.to_thread(
             self._insert_audit_sync,
@@ -242,6 +314,10 @@ class Database:
             diff_summary,
             status,
             validation_result,
+            actor_type,
+            ai_proposal_id,
+            provider,
+            model,
         )
 
     def _insert_audit_sync(
@@ -253,16 +329,79 @@ class Database:
         diff_summary: str | None,
         status: str,
         validation_result: str,
+        actor_type: str = "human",
+        ai_proposal_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (
+                        user_id, nickname, full_path, timestamp, diff_summary, status, validation_result,
+                        actor_type, ai_proposal_id, provider, model
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (user_id, nickname, full_path, timestamp, diff_summary, status, validation_result,
+                     actor_type, ai_proposal_id, provider, model),
+                )
+            except sqlite3.OperationalError:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (
+                        user_id, nickname, full_path, timestamp, diff_summary, status, validation_result
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (user_id, nickname, full_path, timestamp, diff_summary, status, validation_result),
+                )
+
+    async def create_ai_proposal(self, record: AIProposalRecord) -> None:
+        await asyncio.to_thread(self._create_ai_proposal_sync, record)
+
+    def _create_ai_proposal_sync(self, record: AIProposalRecord) -> None:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
-                INSERT INTO audit_log (
-                    user_id, nickname, full_path, timestamp, diff_summary, status, validation_result
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO ai_proposals (
+                    id, session_id, user_id, nickname, provider, model, mode,
+                    prompt_hash, input_hash, output_hash, redaction_applied, created_at,
+                    status, error_message, proposed_payload_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, nickname, full_path, timestamp, diff_summary, status, validation_result),
+                (
+                    record.id,
+                    record.session_id,
+                    record.user_id,
+                    record.nickname,
+                    record.provider,
+                    record.model,
+                    record.mode,
+                    record.prompt_hash,
+                    record.input_hash,
+                    record.output_hash,
+                    1 if record.redaction_applied else 0,
+                    record.created_at,
+                    record.status,
+                    record.error_message,
+                    record.proposed_payload_path,
+                ),
             )
+
+    async def get_ai_proposal(self, proposal_id: str) -> AIProposalRecord | None:
+        return await asyncio.to_thread(self._get_ai_proposal_sync, proposal_id)
+
+    def _get_ai_proposal_sync(self, proposal_id: str) -> AIProposalRecord | None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM ai_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["redaction_applied"] = bool(d.get("redaction_applied"))
+        return AIProposalRecord(**d)
 
     async def get_audit_channel_id(self, guild_id: int) -> int | None:
         return await asyncio.to_thread(self._get_audit_channel_id_sync, guild_id)
