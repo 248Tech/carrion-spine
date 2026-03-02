@@ -1,0 +1,22 @@
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets/config
+.env
+
+# Local runtime data
+data/*.sqlite3
+data/mm_uploads/
+data/mm_diffs/
+
+# Backups
+backups/
+*.bak
