@@ -30,6 +30,19 @@ Managing 7 Days to Die server configs by manual file edits over SSH, panel uploa
 - Role-based access control by Discord role ID
 - SQLite-backed session state and audit log trail
 
+## Discord Bot Setup (Quickstart)
+
+- **Prerequisites:** Linux/macOS or Windows with Python 3.11+; Discord server admin; filesystem access to your config roots. Do not run the bot as root.
+- **Portal:** In [Discord Developer Portal](https://discord.com/developers/applications) create an application, add a bot, copy the token (never commit it). Under Bot → Privileged Gateway Intents, enable only what you need; slash commands work without Message Content. Generate an invite with scopes **bot** and **applications.commands**, and bot permissions: Send Messages, Embed Links, Attach Files, Read Message History, Use Application Commands (and thread permissions if you use threads).
+- **Quickstart:** Install, create config, check, then run:
+  ```bash
+  pipx install carrion-spine
+  carrion-spine init
+  carrion-spine doctor
+  carrion-spine run
+  ```
+  Set `DISCORD_TOKEN` in your environment or `.env` before `run`. Full portal steps, invite URL, roles/channels, Docker, and troubleshooting are in **[Discord Bot Setup (full guide)](docs/discord-bot-setup.md)**.
+
 ## Problem Statement
 
 Game server administration often lacks a reliable change-management layer. Common risks include malformed files, unreviewed edits, race conditions from concurrent updates, and no forensic trail of who changed what.
